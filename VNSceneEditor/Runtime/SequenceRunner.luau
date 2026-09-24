@@ -54,7 +54,12 @@ function SequenceRunner:setSequence(sequence, context, options)
 	self.generation += 1
 
 	local cursor = options.cursor or SequenceState.startCursor(self.sequence)
-	self:setCursor(cursor, { fire = options.fire, silent = options.silent })
+	self:setCursor(cursor, {
+		fire = options.fire,
+		silent = options.silent,
+		render = options.render,
+		backgroundOnly = options.backgroundOnly,
+	})
 end
 
 function SequenceRunner:setContext(context)
@@ -92,7 +97,7 @@ end
 -- Rendering
 --------------------------------------------------------------------------------
 
-function SequenceRunner:_render()
+function SequenceRunner:_render(backgroundOnly)
 	local renderContext = {
 		scene = self.context.scene,
 		project = self.context.project,
@@ -107,6 +112,13 @@ function SequenceRunner:_render()
 		flags = self:_flags(),
 		flagsAreAuthoritative = self.context.flagsAreAuthoritative == true,
 	})
+	if backgroundOnly then
+		-- The transition needs the destination environment underneath its overlay,
+		-- but not a prematurely visible portrait or dialogue box. Keep the same
+		-- computed background/camera state that normal playback will use.
+		self.snapshot.portrait = nil
+		self.snapshot.dialogue = nil
+	end
 
 	self.presenter:render(self.snapshot, renderContext)
 end
@@ -136,7 +148,10 @@ function SequenceRunner:_fire(events)
 	self.EventsFired:Fire(events)
 end
 
--- options: fire (bool) plays the anchor's events, silent skips CursorChanged.
+-- options: fire (bool) plays the anchor's events, silent skips CursorChanged,
+-- render=false records the cursor without drawing. backgroundOnly prepares a
+-- destination's background/camera beneath a transition while withholding its
+-- foreground UI. Playback's first full render performs the normal entrance.
 function SequenceRunner:setCursor(cursor, options)
 	options = options or {}
 
@@ -145,7 +160,9 @@ function SequenceRunner:setCursor(cursor, options)
 	self.dialogueWaitTime = 0
 	self.dialogueWaitEntryId = nil
 
-	self:_render()
+	if options.render ~= false then
+		self:_render(options.backgroundOnly == true)
+	end
 
 	if options.fire and self.cursor then
 		self:_fire(SequenceState.eventsAtCursor(self.sequence, self.cursor))
@@ -185,7 +202,9 @@ function SequenceRunner:play(fromStart)
 	self.advancing = false
 	self:_setPlaying(true)
 
+	local generation = self.generation
 	self:setCursor(self.cursor, { fire = true })
+	if generation ~= self.generation or not self.playing then return end
 
 	if self.connection then
 		self.connection:Disconnect()
@@ -230,11 +249,13 @@ function SequenceRunner:_step(dt)
 	if segment.kind == "Timed" then
 		local previous = self.cursor.time
 		local nextTime = previous + dt
+		local generation = self.generation
 
 		if nextTime >= segment.duration then
 			self.cursor.time = segment.duration
 			self:_render()
 			self:_fire(SequenceState.eventsBetween(segment, previous, segment.duration))
+			if generation ~= self.generation then return end
 			self:_moveNext()
 			return
 		end
@@ -242,6 +263,7 @@ function SequenceRunner:_step(dt)
 		self.cursor.time = nextTime
 		self:_render()
 		self:_fire(SequenceState.eventsBetween(segment, previous, nextTime))
+		if generation ~= self.generation then return end
 		self.CursorChanged:Fire(self.cursor)
 	else
 		self.cursor.entryTime += dt

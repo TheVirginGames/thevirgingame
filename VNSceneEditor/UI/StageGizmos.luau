@@ -163,7 +163,8 @@ function StageGizmos:_updateHotspots()
 	local scene = app.scene
 	Widgets.clearChildren(self.hotspotLayer)
 
-	if not scene or scene.stage.kind == "Novel2D" then
+	local subscene = app:getActiveSubscene()
+	if not scene or not subscene or subscene.kind == "Novel2D" then
 		return
 	end
 
@@ -177,6 +178,7 @@ function StageGizmos:_updateHotspots()
 	local layerPos = self.hotspotLayer.AbsolutePosition
 
 	for _, interaction in ipairs(scene.interactions) do
+		if not Schema.interactionInSubscene(scene, subscene, interaction) then continue end
 		local target = WorldBindings.resolve(interaction.targetId)
 		local center = WorldBindings.centerOf(target)
 

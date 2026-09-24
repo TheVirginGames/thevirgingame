@@ -377,6 +377,10 @@ end
 function ChapterFlowView:_flowLocation(scene, link)
 	local anchor = link.anchor or {}
 	local owner = link.owner == "outro" and "Outro" or "Intro"
+	if link.owner == "subscene" then
+		local subscene = Schema.subsceneIndex(scene, link.subsceneId)
+		owner = subscene and subscene.name or "Subscene"
+	end
 	if link.owner == "interaction" then
 		local interaction = Schema.findInteraction(scene, link.interactionId)
 		owner = interaction and interaction.name or "Interaction"
@@ -422,9 +426,12 @@ end
 
 function ChapterFlowView:_buildNode(scene, chapter)
 	local app = self.app
+	local subscenes = Schema.ensureSubscenes(scene)
+	local firstKind = subscenes[1].kind
+	local lastKind = subscenes[#subscenes].kind
 	local isStart = chapter.startSceneId == scene.id
 	local isSelected = self.selectedSceneId == scene.id
-	local color = KIND_COLORS[scene.stage.kind]
+	local color = KIND_COLORS[firstKind]
 	local links = Schema.sceneLinks(scene)
 	local markers = Schema.sceneFlowMarkers(scene)
 	local routes = {}
@@ -458,13 +465,34 @@ function ChapterFlowView:_buildNode(scene, chapter)
 		Name = "Header",
 		Text = "",
 		Size = UDim2.new(1, 0, 0, 30),
-		BackgroundColor3 = color,
-		BackgroundTransparency = 0.75,
+		BackgroundColor3 = firstKind == lastKind and color or Theme.Row,
+		BackgroundTransparency = firstKind == lastKind and 0.75 or 0,
 		BorderSizePixel = 0,
 		AutoButtonColor = false,
 		ZIndex = 14,
 		Parent = node,
 	}, { Widgets.corner(8) })
+	if firstKind ~= lastKind then
+		Widgets.create("Frame", {
+			Name = "FirstSubsceneHalf",
+			Size = UDim2.new(0.5, 0, 1, 0),
+			BackgroundColor3 = color,
+			BackgroundTransparency = 0.75,
+			BorderSizePixel = 0,
+			ZIndex = 14,
+			Parent = header,
+		})
+		Widgets.create("Frame", {
+			Name = "LastSubsceneHalf",
+			Position = UDim2.new(0.5, 0, 0, 0),
+			Size = UDim2.new(0.5, 0, 1, 0),
+			BackgroundColor3 = KIND_COLORS[lastKind],
+			BackgroundTransparency = 0.75,
+			BorderSizePixel = 0,
+			ZIndex = 14,
+			Parent = header,
+		})
+	end
 
 	local lastClick = 0
 	header.MouseButton1Down:Connect(function()
@@ -482,7 +510,7 @@ function ChapterFlowView:_buildNode(scene, chapter)
 	Widgets.label({
 		Text = scene.name,
 		Position = UDim2.new(0, 10, 0, 0),
-		Size = UDim2.new(1, -70, 1, 0),
+		Size = firstKind == lastKind and UDim2.new(1, -70, 1, 0) or UDim2.new(0.5, -12, 1, 0),
 		Font = Theme.FontBold,
 		TextSize = 12,
 		ZIndex = 15,
@@ -490,14 +518,14 @@ function ChapterFlowView:_buildNode(scene, chapter)
 	})
 
 	Widgets.label({
-		Text = scene.stage.kind,
+		Text = firstKind == lastKind and firstKind or (firstKind .. " → " .. lastKind),
 		AnchorPoint = Vector2.new(1, 0.5),
 		Position = UDim2.new(1, -8, 0.5, 0),
-		Size = UDim2.new(0, 60, 0, 16),
+		Size = UDim2.new(0, 114, 0, 16),
 		TextXAlignment = Enum.TextXAlignment.Right,
 		TextSize = 9,
 		Font = Theme.FontBold,
-		TextColor3 = color,
+		TextColor3 = firstKind == lastKind and color or KIND_COLORS[lastKind],
 		ZIndex = 15,
 		Parent = header,
 	})
@@ -514,14 +542,14 @@ function ChapterFlowView:_buildNode(scene, chapter)
 		Parent = node,
 	})
 
-	local canSetNext = scene.stage.kind == "Novel2D"
+	local canSetNext = lastKind == "Novel2D"
 	local nextPort = self:_makePort(node, "Next", NODE_WIDTH, 48, LINK_COLORS.next, canSetNext)
 	self.ports[scene.id].outputs.next = nextPort
 	nextPort.button.MouseButton1Down:Connect(function()
 		if canSetNext then
 			self:_beginConnection(scene, "next", normalLink)
 		else
-			app:notify("Normal next-scene flow is available to Novel2D scenes. Use an Exit or Go To Scene effect for 3D scenes.", Theme.Danger)
+			app:notify("Normal next-scene flow is available when the final subscene is Novel2D. Use an Exit or Go To Scene effect for 3D endings.", Theme.Danger)
 		end
 	end)
 	nextPort.button.MouseButton2Click:Connect(function()
@@ -556,7 +584,7 @@ function ChapterFlowView:_buildNode(scene, chapter)
 		})
 	end
 
-	local summary = string.format("%d lines  .  %d effects", Schema.countLines(scene), Schema.countEvents(scene))
+	local summary = string.format("%d subscenes  .  %d lines  .  %d effects", #subscenes, Schema.countLines(scene), Schema.countEvents(scene))
 	Widgets.label({
 		Text = summary,
 		Position = UDim2.new(0, isStart and 56 or 10, 0, 31),

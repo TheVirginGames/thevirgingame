@@ -5,7 +5,7 @@
 -- as "r,g,b" and camera poses as twelve comma separated CFrame components.
 --
 --   Project = {
---       formatVersion = 2, name,
+--       formatVersion = 3, name,
 --       characters       = { { name, portraits = { imageId, ... } }, ... },
 --       cameraPoses      = { { id, name, cframe }, ... },
 --       textboxPresets   = { TextboxPreset, ... },
@@ -19,16 +19,23 @@
 --
 --   Scene = {
 --       id, name, flow = { x, y },
---       stage = { kind = "Novel2D" | "Room3D" | "Explore3D", cameraPoseId },
---       background = { kind = "Color" | "Image" | "Camera3D", value, poseId },
+--       subscenes = { Subscene, ... },            -- ordered default progression
 --       flags = { { id, kind, default } },           -- local to this scene
---       intro = Sequence, outro = Sequence,
 --       interactions = { Interaction },
 --       next = { sceneId, transitionId },          -- Novel2D auto advance
 --   }
 --
+--   Subscene = {
+--       id, name, role = "intro" | "outro" | "custom",
+--       kind = "Novel2D" | "Room3D" | "Explore3D",
+--       stage = { kind, cameraPoseId }, background = { kind, value, poseId },
+--       sequence = Sequence, nextTransitionId, awaitRoutes, linkPreviousRoom,
+--       linkedRoomId,
+--   }
+--
 --   Interaction = {
 --       id, name, kind = "Hotspot" | "Trigger" | "Exit", targetId,
+--       scope = "Local" | "Shared", subsceneId,
 --       conditions = { { flag, op, value } }, repeatPolicy = "once" | "always",
 --       transitionId,                              -- enter transition (e.g. NpcTalk), reversed on exit
 --       sequence = Sequence, onComplete = { Event },
@@ -47,7 +54,8 @@ local Migrate = require(script.Parent.Migrate)
 
 local Schema = {}
 
-Schema.FORMAT_VERSION = 2
+Schema.FORMAT_VERSION = 3
+Schema.pendingWarnings = {}
 Schema.MIN_DURATION = 0.25
 Schema.MAX_DURATION = 120
 Schema.DEFAULT_DIALOGUE_AUTO_ADVANCE = 2.5
@@ -296,11 +304,217 @@ function Schema.newInteraction(kind)
 		targetId = "",
 		conditions = {},
 		repeatPolicy = kind == "Exit" and "always" or "once",
+		scope = "Shared",
+		subsceneId = "",
 		transitionId = "",
 		sequence = Schema.newSequence(false),
 		onComplete = {},
 		exit = { sceneId = "", transitionId = Schema.DEFAULT_FADE },
 	}
+end
+
+-- A subscene owns its environment and sequence; flags remain on the scene node.
+function Schema.newSubscene(name, kind)
+	kind = kind or "Novel2D"
+	return {
+		id = Schema.newId("sub"),
+		name = name or "Subscene",
+		role = "custom",
+		kind = kind,
+		stage = { kind = kind, cameraPoseId = "" },
+		background = { kind = kind == "Novel2D" and "Color" or "Camera3D", value = "40,44,72", poseId = "" },
+		sequence = Schema.newSequence(false),
+		nextTransitionId = Schema.DEFAULT_FADE,
+		awaitRoutes = {},
+		linkPreviousRoom = false,
+		linkedRoomId = "",
+	}
+end
+
+function Schema.subsceneIndex(scene, id)
+	return Schema.findById(scene and scene.subscenes, id)
+end
+
+function Schema.subsceneView(scene, subscene)
+	local view = table.clone(scene)
+	view.stage = table.clone(subscene.stage)
+	view.background = table.clone(subscene.background)
+	if subscene.linkPreviousRoom and Schema.isValidRoomLink(scene, subscene) then
+		local previous = Schema.previousSubscene(scene, subscene.id)
+		view.background = Schema.subsceneView(scene, previous).background
+		local poseId = Schema.effectivePoseId(scene, subscene)
+		view.stage.cameraPoseId = poseId
+		view.background.poseId = poseId
+	end
+	return view
+end
+
+function Schema.previousSubscene(scene, subsceneId)
+	local _, index = Schema.subsceneIndex(scene, subsceneId)
+	return index and scene.subscenes[index - 1] or nil
+end
+
+function Schema.isValidRoomLink(scene, subscene)
+	local previous = Schema.previousSubscene(scene, subscene.id)
+	return subscene.kind == "Room3D" and previous ~= nil and previous.kind == "Room3D"
+		and subscene.linkedRoomId == previous.id
+end
+
+-- Merge is a property of a concrete source → destination transition. The
+-- destination must be the immediately following Room3D and be permanently
+-- linked back to that exact source; merely having two Room3Ds in a scene is
+-- never enough.
+function Schema.isValidMergeBetween(scene, source, destination)
+	if type(source) == "string" then source = Schema.subsceneIndex(scene, source) end
+	if type(destination) == "string" then destination = Schema.subsceneIndex(scene, destination) end
+	if not source or not destination or source.kind ~= "Room3D" or destination.kind ~= "Room3D" then
+		return false
+	end
+	local previous = Schema.previousSubscene(scene, destination.id)
+	return destination.linkPreviousRoom == true
+		and destination.linkedRoomId == source.id
+		and previous ~= nil and previous.id == source.id
+end
+
+function Schema.isValidMerge(scene, subscene)
+	local _, index = Schema.subsceneIndex(scene, subscene and subscene.id)
+	return index ~= nil and Schema.isValidMergeBetween(scene, subscene, scene.subscenes[index + 1])
+end
+
+function Schema.defaultSubsceneTransition(scene, source, destinationId)
+	return Schema.isValidMergeBetween(scene, source, destinationId) and "Merge" or Schema.DEFAULT_FADE
+end
+
+-- Empty linear sequences do not create a visible or interactive state, so
+-- automatic Novel2D progression skips them. A 3D subscene remains meaningful
+-- even with an empty sequence because it can enter AWAIT with its environment,
+-- routes, and interactions active.
+function Schema.nextAutomaticSubscene(scene, source)
+	if type(source) == "string" then source = Schema.subsceneIndex(scene, source) end
+	local _, index = Schema.subsceneIndex(scene, source and source.id)
+	if not index then return nil end
+	for candidateIndex = index + 1, #(scene.subscenes or {}) do
+		local candidate = scene.subscenes[candidateIndex]
+		if candidate.kind ~= "Novel2D" or #candidate.sequence.segments > 0 then
+			return candidate, candidateIndex
+		end
+	end
+	return nil
+end
+
+function Schema.effectivePoseId(scene, subscene)
+	local previous = Schema.previousSubscene(scene, subscene.id)
+	if subscene.linkPreviousRoom and previous and Schema.isValidRoomLink(scene, subscene) then
+		return Schema.effectivePoseId(scene, previous)
+	end
+	return subscene.stage.cameraPoseId ~= "" and subscene.stage.cameraPoseId or subscene.background.poseId
+end
+
+function Schema.interactionInSubscene(scene, subscene, interaction)
+	if interaction.scope ~= "Local" then return true end
+	if interaction.subsceneId == "" then return false end
+	local current = subscene
+	while current do
+		if interaction.subsceneId == current.id then return true end
+		if not current.linkPreviousRoom or not Schema.isValidRoomLink(scene, current) then break end
+		current = Schema.previousSubscene(scene, current.id)
+	end
+	return false
+end
+
+-- Repair structural edits in one place so saved data never keeps a broken Merge.
+function Schema.reconcileSubscenes(scene)
+	local warnings = {}
+	for _, subscene in ipairs(scene.subscenes or {}) do
+		if subscene.linkPreviousRoom and not Schema.isValidRoomLink(scene, subscene) then
+			subscene.linkPreviousRoom = false
+			subscene.linkedRoomId = ""
+			table.insert(warnings, subscene.name .. " lost its Room3D link after the sequence order or kind changed.")
+		end
+	end
+	for _, subscene in ipairs(scene.subscenes or {}) do
+		for _, route in ipairs(subscene.awaitRoutes or {}) do
+			if route.toSubsceneId ~= "" and (route.toSubsceneId == subscene.id
+				or not Schema.subsceneIndex(scene, route.toSubsceneId)) then
+				route.toSubsceneId = ""
+				table.insert(warnings, subscene.name .. " had an invalid conditional route; destination cleared.")
+			end
+			if route.transitionId == "Merge" and not Schema.isValidMergeBetween(scene, subscene, route.toSubsceneId) then
+				route.transitionId = Schema.DEFAULT_FADE
+				table.insert(warnings, subscene.name .. " had an incompatible Merge route; changed to Fade to Black.")
+			elseif route.transitionExplicit ~= true
+				and Schema.isValidMergeBetween(scene, subscene, route.toSubsceneId) then
+				route.transitionId = "Merge"
+			end
+		end
+		if subscene.nextTransitionId == "Merge" and not Schema.isValidMerge(scene, subscene) then
+			subscene.nextTransitionId = Schema.DEFAULT_FADE
+			table.insert(warnings, subscene.name .. " used an incompatible Merge; changed to Fade to Black.")
+		end
+	end
+	for _, interaction in ipairs(scene.interactions or {}) do
+		if interaction.scope == "Local" and interaction.subsceneId ~= "" and not Schema.subsceneIndex(scene, interaction.subsceneId) then
+			interaction.subsceneId = ""
+			table.insert(warnings, interaction.name .. " referred to a missing subscene and is disabled until reassigned.")
+		end
+	end
+	Schema.forEachEventList(scene, function(events, owner)
+		local source = nil
+		if owner.owner == "subscene" then
+			source = Schema.subsceneIndex(scene, owner.subsceneId)
+		elseif owner.owner == "interaction" then
+			local interaction = Schema.findInteraction(scene, owner.interactionId)
+			if interaction and interaction.scope == "Local" then
+				source = Schema.subsceneIndex(scene, interaction.subsceneId)
+			end
+		end
+		for _, event in ipairs(events) do
+			if event.type == "FlowGotoSubscene" and event.params.subsceneId ~= ""
+				and not Schema.subsceneIndex(scene, event.params.subsceneId) then
+				event.params.subsceneId = ""
+				table.insert(warnings, "A Go to Subscene event had a missing destination; destination cleared.")
+			end
+			if event.type == "FlowGotoSubscene" and event.params.transitionId == "Merge"
+				and not Schema.isValidMergeBetween(scene, source, event.params.subsceneId) then
+				event.params.transitionId = Schema.DEFAULT_FADE
+				table.insert(warnings, "A Go to Subscene event had an incompatible Merge; changed to Fade to Black.")
+			elseif event.type == "FlowGotoSubscene" and event.transitionExplicit ~= true
+				and Schema.isValidMergeBetween(scene, source, event.params.subsceneId) then
+				event.params.transitionId = "Merge"
+			end
+		end
+	end)
+	if #warnings > 0 then
+		local pending = Schema.pendingWarnings[scene.id] or {}
+		for _, warning in ipairs(warnings) do table.insert(pending, warning) end
+		Schema.pendingWarnings[scene.id] = pending
+	end
+	return warnings
+end
+
+function Schema.takeWarnings(sceneId)
+	local warnings = Schema.pendingWarnings[sceneId] or {}
+	Schema.pendingWarnings[sceneId] = nil
+	return warnings
+end
+
+function Schema.ensureSubscenes(scene)
+	if type(scene.subscenes) == "table" and #scene.subscenes > 0 then
+		return scene.subscenes
+	end
+	local intro = Schema.newSubscene("Intro", scene.stage.kind)
+	intro.role = "intro"
+	intro.stage = Schema.deepCopy(scene.stage)
+	intro.background = Schema.deepCopy(scene.background)
+	intro.sequence = scene.intro
+	intro.nextTransitionId = "" -- Existing Intro → Outro playback had no transition.
+	local outro = Schema.newSubscene("Outro", scene.stage.kind)
+	outro.role = "outro"
+	outro.stage = Schema.deepCopy(scene.stage)
+	outro.background = Schema.deepCopy(scene.background)
+	outro.sequence = scene.outro
+	scene.subscenes = { intro, outro }
+	return scene.subscenes
 end
 
 function Schema.newFlag(id, kind)
@@ -460,6 +674,12 @@ function Schema.ensureDefaults(project)
 	project.portraitLayout = Schema.normalizePortraitLayout(project.portraitLayout)
 	project.chapters = project.chapters or {}
 	project.recycleBin = project.recycleBin or Schema.emptyRecycleBin()
+	for _, chapter in ipairs(project.chapters) do
+		for _, scene in ipairs(chapter.scenes or {}) do
+			Schema.ensureSubscenes(scene)
+			Schema.reconcileSubscenes(scene)
+		end
+	end
 
 	if not Schema.findById(project.textboxPresets, Schema.DEFAULT_TEXTBOX) then
 		local preset = Schema.newTextboxPreset("Default")
@@ -741,27 +961,33 @@ end
 
 -- Every sequence a scene owns, with a label for the sequence selector.
 function Schema.sequencesOf(scene)
-	local list = {
-		{ owner = "intro", label = "Intro", sequence = scene.intro },
-	}
+	local list = {}
+	for _, subscene in ipairs(Schema.ensureSubscenes(scene)) do
+		local roleLabel = subscene.role == "intro" and subscene.name ~= "Intro" and " [Intro]"
+			or subscene.role == "outro" and subscene.name ~= "Outro" and " [Outro]" or ""
+		table.insert(list, {
+			owner = "subscene", subsceneId = subscene.id,
+			label = subscene.name .. roleLabel .. " · " .. subscene.kind,
+			sequence = subscene.sequence,
+		})
+	end
 
 	for _, interaction in ipairs(scene.interactions or {}) do
 		table.insert(list, {
 			owner = "interaction",
 			interactionId = interaction.id,
-			label = interaction.name,
+			label = "Interaction: " .. interaction.name,
 			sequence = interaction.sequence,
 		})
 	end
-
-	table.insert(list, { owner = "outro", label = "Outro", sequence = scene.outro })
 
 	return list
 end
 
 function Schema.getSequence(scene, owner, interactionId)
-	if owner == "outro" then
-		return scene.outro
+	if owner == "subscene" then
+		local subscene = Schema.subsceneIndex(scene, interactionId)
+		return subscene and subscene.sequence or nil
 	end
 
 	if owner == "interaction" then
@@ -769,6 +995,7 @@ function Schema.getSequence(scene, owner, interactionId)
 		return interaction and interaction.sequence or nil
 	end
 
+	if owner == "outro" then return scene.outro end
 	return scene.intro
 end
 
@@ -844,7 +1071,9 @@ end
 function Schema.sceneLinks(scene)
 	local links = {}
 
-	if scene.stage.kind == "Novel2D" and scene.next and scene.next.sceneId ~= "" then
+	local subscenes = Schema.ensureSubscenes(scene)
+	local last = subscenes[#subscenes]
+	if last and last.kind == "Novel2D" and scene.next and scene.next.sceneId ~= "" then
 		table.insert(links, {
 			id = "next",
 			kind = "next",
@@ -877,6 +1106,7 @@ function Schema.sceneLinks(scene)
 					eventId = event.id,
 					owner = owner.owner,
 					interactionId = owner.interactionId,
+					subsceneId = owner.subsceneId,
 					anchor = anchor,
 					eventTime = event.time,
 					toSceneId = event.params.sceneId,
@@ -904,6 +1134,7 @@ function Schema.sceneFlowMarkers(scene)
 					eventId = event.id,
 					owner = owner.owner,
 					interactionId = owner.interactionId,
+					subsceneId = owner.subsceneId,
 					anchor = anchor,
 					eventTime = event.time,
 					label = "End Chapter",
@@ -913,6 +1144,27 @@ function Schema.sceneFlowMarkers(scene)
 	end)
 
 	return markers
+end
+
+function Schema.clearSubsceneDestinations(scene, subsceneId)
+	for _, subscene in ipairs(scene.subscenes or {}) do
+		for _, route in ipairs(subscene.awaitRoutes or {}) do
+			if route.toSubsceneId == subsceneId then route.toSubsceneId = "" end
+		end
+	end
+	Schema.forEachEventList(scene, function(events)
+		for _, event in ipairs(events) do
+			if event.type == "FlowGotoSubscene" and event.params.subsceneId == subsceneId then
+				event.params.subsceneId = ""
+			end
+		end
+	end)
+	for index = #(scene.interactions or {}), 1, -1 do
+		local interaction = scene.interactions[index]
+		if interaction.scope == "Local" and interaction.subsceneId == subsceneId then
+			table.remove(scene.interactions, index)
+		end
+	end
 end
 
 -- Clear only destinations that point at a deleted scene. The transition and
@@ -970,6 +1222,12 @@ end
 -- Fresh ids throughout a copied scene so two scenes never share entry ids.
 function Schema.reidentifyScene(scene)
 	scene.id = Schema.newId("scene")
+	local subsceneIds = {}
+	for _, subscene in ipairs(Schema.ensureSubscenes(scene)) do
+		local oldId = subscene.id
+		subscene.id = Schema.newId("sub")
+		subsceneIds[oldId] = subscene.id
+	end
 
 	local function reidSequence(sequence)
 		for _, segment in ipairs(sequence.segments) do
@@ -996,16 +1254,30 @@ function Schema.reidentifyScene(scene)
 		end
 	end
 
-	reidSequence(scene.intro)
-	reidSequence(scene.outro)
+	for _, subscene in ipairs(scene.subscenes) do
+		subscene.linkedRoomId = subsceneIds[subscene.linkedRoomId] or ""
+		reidSequence(subscene.sequence)
+		for _, route in ipairs(subscene.awaitRoutes or {}) do
+			route.id = Schema.newId("route")
+			route.toSubsceneId = subsceneIds[route.toSubsceneId] or ""
+		end
+	end
 
 	for _, interaction in ipairs(scene.interactions) do
 		interaction.id = Schema.newId("int")
+		interaction.subsceneId = subsceneIds[interaction.subsceneId] or ""
 		reidSequence(interaction.sequence)
 		for _, event in ipairs(interaction.onComplete) do
 			event.id = Schema.newId("evt")
 		end
 	end
+	Schema.forEachEventList(scene, function(events)
+		for _, event in ipairs(events) do
+			if event.type == "FlowGotoSubscene" then
+				event.params.subsceneId = subsceneIds[event.params.subsceneId] or ""
+			end
+		end
+	end)
 
 	return scene
 end
@@ -1056,6 +1328,7 @@ function Schema.normalizeEvent(raw)
 		duration = math.max(0, asNumber(raw.duration, 0)),
 		easing = oneOf(raw.easing, Schema.EASINGS, "Quad"),
 		params = params,
+		transitionExplicit = raw.transitionExplicit == true,
 	}
 end
 
@@ -1264,6 +1537,8 @@ function Schema.normalizeInteraction(raw)
 		targetId = asString(raw.targetId, ""),
 		conditions = conditions,
 		repeatPolicy = oneOf(raw.repeatPolicy, Schema.REPEAT_POLICIES, "once"),
+		scope = oneOf(raw.scope, { "Local", "Shared" }, "Shared"),
+		subsceneId = asString(raw.subsceneId, ""),
 		transitionId = asString(raw.transitionId, ""),
 		sequence = Schema.normalizeSequence(raw.sequence),
 		onComplete = normalizeEventList(raw.onComplete),
@@ -1271,6 +1546,47 @@ function Schema.normalizeInteraction(raw)
 			sceneId = asString(rawGoto.sceneId, ""),
 			transitionId = asString(rawGoto.transitionId, Schema.DEFAULT_FADE),
 		},
+	}
+end
+
+local function normalizeSubscene(raw)
+	if type(raw) ~= "table" then return nil end
+	local stage = type(raw.stage) == "table" and raw.stage or {}
+	local kind = oneOf(raw.kind or stage.kind, Schema.SCENE_KINDS, "Novel2D")
+	local background = type(raw.background) == "table" and raw.background or {}
+	local routes = {}
+	for _, rawRoute in ipairs(type(raw.awaitRoutes) == "table" and raw.awaitRoutes or {}) do
+		if type(rawRoute) == "table" then
+			local conditions = {}
+			for _, rawCondition in ipairs(type(rawRoute.conditions) == "table" and rawRoute.conditions or {}) do
+				local condition = Schema.normalizeCondition(rawCondition)
+				if condition then table.insert(conditions, condition) end
+			end
+			table.insert(routes, {
+				id = asString(rawRoute.id, Schema.newId("route")),
+				conditions = conditions,
+				toSubsceneId = asString(rawRoute.toSubsceneId, ""),
+				transitionId = asString(rawRoute.transitionId, Schema.DEFAULT_FADE),
+				transitionExplicit = rawRoute.transitionExplicit == true,
+			})
+		end
+	end
+	return {
+		id = asString(raw.id, Schema.newId("sub")),
+		name = asString(raw.name, "Subscene"),
+		role = oneOf(raw.role, { "intro", "outro", "custom" }, "custom"),
+		kind = kind,
+		stage = { kind = kind, cameraPoseId = asString(stage.cameraPoseId, "") },
+		background = {
+			kind = oneOf(background.kind, Schema.BACKGROUND_KINDS, kind == "Novel2D" and "Color" or "Camera3D"),
+			value = asString(background.value, "40,44,72"),
+			poseId = asString(background.poseId, ""),
+		},
+		sequence = Schema.normalizeSequence(raw.sequence),
+		nextTransitionId = asString(raw.nextTransitionId, Schema.DEFAULT_FADE),
+		awaitRoutes = routes,
+		linkPreviousRoom = raw.linkPreviousRoom == true,
+		linkedRoomId = asString(raw.linkedRoomId, ""),
 	}
 end
 
@@ -1316,7 +1632,7 @@ function Schema.normalizeScene(raw)
 		rawIntro = { segments = raw.segments }
 	end
 
-	return {
+	local scene = {
 		id = asString(raw.id, Schema.newId("scene")),
 		name = asString(raw.name, "Untitled Scene"),
 		flow = { x = asNumber(rawFlow.x, 80), y = asNumber(rawFlow.y, 80) },
@@ -1335,6 +1651,21 @@ function Schema.normalizeScene(raw)
 			transitionId = asString(rawNext.transitionId, Schema.DEFAULT_FADE),
 		},
 	}
+	if type(raw.subscenes) == "table" then
+		scene.subscenes = {}
+		local seenIds = {}
+		for _, rawSubscene in ipairs(raw.subscenes) do
+			local subscene = normalizeSubscene(rawSubscene)
+			if subscene then
+				if seenIds[subscene.id] then subscene.id = Schema.newId("sub") end
+				seenIds[subscene.id] = true
+				table.insert(scene.subscenes, subscene)
+			end
+		end
+	end
+	Schema.ensureSubscenes(scene)
+	Schema.reconcileSubscenes(scene)
+	return scene
 end
 
 function Schema.normalizeFlag(raw)

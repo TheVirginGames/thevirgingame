@@ -195,9 +195,22 @@ end
 -- Scene section
 --------------------------------------------------------------------------------
 
+-- Merge is an editor-only pseudo transition. Offer it solely for the exact
+-- source → destination pair that has a permanent adjacent Room3D link.
+function InspectorView:_subsceneTransitionItems(source, destinationId)
+	local items = self.app:pickerItems("transition")
+	if Schema.isValidMergeBetween(self.app.scene, source, destinationId) then
+		table.insert(items, 1, { id = "Merge", label = "Merge (continuous Room3D)" })
+	end
+	return items
+end
+
 function InspectorView:_renderScene()
 	local app = self.app
 	local scene = app.scene
+	local subscene = app:getActiveSubscene()
+	local stage = subscene.stage
+	local background = subscene.background
 	local project = app:getProject()
 
 	self:_heading("Scene")
@@ -208,53 +221,87 @@ function InspectorView:_renderScene()
 		app:markDirty()
 	end)
 
-	self:_choiceField("Kind", Schema.SCENE_KINDS, scene.stage.kind, function(kind)
-		scene.stage.kind = kind
-		if kind ~= "Novel2D" and scene.background.kind ~= "Camera3D" then
-			scene.background.kind = "Camera3D"
+	self:_heading("Current subscene: " .. subscene.name)
+	self:_textField("Subscene name", subscene.name, function(text)
+		local trimmed = Schema.trimName(text)
+		if trimmed ~= "" then subscene.name = trimmed end
+		app:markDirty()
+	end)
+	self:_choiceField("Kind", Schema.SCENE_KINDS, subscene.kind, function(kind)
+		subscene.kind = kind
+		stage.kind = kind
+		if kind ~= "Novel2D" and background.kind ~= "Camera3D" then
+			background.kind = "Camera3D"
 		end
 		app:onSceneStageChanged()
 		app:markDirty()
 	end)
 
-	if scene.stage.kind == "Novel2D" then
-		self:_hint("Linear scene: intro plays, then the outro, then it advances to the next scene.")
-	elseif scene.stage.kind == "Room3D" then
-		self:_hint("Fixed camera room: intro plays, then the player clicks hotspots. Exits lead to other scenes.")
+	if subscene.kind == "Novel2D" then
+		self:_hint("Plays its sequence, then continues to the next subscene in this node.")
+	elseif subscene.kind == "Room3D" then
+		self:_hint("Fixed camera room: after its sequence, waits for interactions or a conditional route.")
 	else
-		self:_hint("Free roam: the player walks. Hotspots get a prompt; triggers and exits fire on touch.")
+		self:_hint("Free roam: after its sequence, waits for interactions or a conditional route.")
+	end
+	local previous = Schema.previousSubscene(scene, subscene.id)
+	if subscene.kind == "Room3D" and previous and previous.kind == "Room3D" then
+		self:_buttonRow({ { text = subscene.linkPreviousRoom and "Unlink Previous Room3D" or "Link to Previous Room3D", onClick = function()
+			subscene.linkPreviousRoom = not subscene.linkPreviousRoom
+			subscene.linkedRoomId = subscene.linkPreviousRoom and previous.id or ""
+			if subscene.linkPreviousRoom then previous.nextTransitionId = "Merge" end
+			app:markDirty()
+		end } })
+		if subscene.linkPreviousRoom then self:_hint("Uses the previous Room3D's camera pose and local interactions by reference.") end
 	end
 
 	self:_heading("Background")
 
-	self:_choiceField("Type", Schema.BACKGROUND_KINDS, scene.background.kind, function(kind)
-		scene.background.kind = kind
+	self:_choiceField("Type", Schema.BACKGROUND_KINDS, background.kind, function(kind)
+		background.kind = kind
 		app:onSceneStageChanged()
 		app:markDirty()
 	end)
 
-	if scene.background.kind == "Color" then
-		self:_textField("Colour (r,g,b)", scene.background.value, function(text)
-			scene.background.value = text
+	if background.kind == "Color" then
+		self:_textField("Colour (r,g,b)", background.value, function(text)
+			background.value = text
 			app:markDirty()
 		end, { mono = true })
-	elseif scene.background.kind == "Image" then
-		self:_textField("Image id", scene.background.value, function(text)
-			scene.background.value = text
+	elseif background.kind == "Image" then
+		self:_textField("Image id", background.value, function(text)
+			background.value = text
 			app:markDirty()
 		end, { mono = true, placeholder = "rbxassetid://..." })
 	end
 
-	if scene.background.kind == "Camera3D" or scene.stage.kind ~= "Novel2D" then
-		self:_renderPoseField("Camera pose", scene.stage.cameraPoseId, function(poseId)
-			scene.stage.cameraPoseId = poseId
-			scene.background.poseId = poseId
+	if background.kind == "Camera3D" or subscene.kind ~= "Novel2D" then
+		if subscene.linkPreviousRoom then
+			local pose = Schema.findCameraPose(project, Schema.effectivePoseId(scene, subscene))
+			self:_caption("Linked camera pose: " .. (pose and pose.name or "none"))
+		else
+		self:_renderPoseField("Camera pose", stage.cameraPoseId, function(poseId)
+			stage.cameraPoseId = poseId
+			background.poseId = poseId
 			app:onSceneStageChanged()
 			app:markDirty()
 		end)
+		end
 	end
 
-	if scene.stage.kind == "Novel2D" then
+	local nextAutomaticSubscene = Schema.nextAutomaticSubscene(scene, subscene)
+	if nextAutomaticSubscene and subscene.kind == "Novel2D" then
+		self:_heading("To next subscene")
+		self:_dropdownField("Transition", self:_subsceneTransitionItems(subscene, nextAutomaticSubscene.id), subscene.nextTransitionId, function(id)
+			subscene.nextTransitionId = id
+			app:markDirty()
+		end, "Fade to Black")
+	elseif subscene.kind ~= "Novel2D" and #scene.subscenes > 1 then
+		self:_hint("This " .. subscene.kind .. " subscene enters AWAIT after its sequence. Use a conditional route, Go to Subscene event, or interaction to leave it.")
+	end
+	if subscene.kind ~= "Novel2D" then self:_renderAwaitRoutes(subscene) end
+
+	if scene.subscenes[#scene.subscenes].kind == "Novel2D" then
 		self:_heading("After this scene")
 
 		self:_dropdownField("Next scene", app:pickerItems("scene", scene.id), scene.next.sceneId, function(sceneId)
@@ -266,25 +313,98 @@ function InspectorView:_renderScene()
 			scene.next.transitionId = transitionId
 			app:markDirty()
 		end, "(cut)")
-	else
+	elseif subscene.kind ~= "Novel2D" then
 		self:_heading("Interactions")
 		self:_hint(string.format("%d interaction(s). Manage them in the panel on the left when no sequence is open.", #scene.interactions))
 	end
 
-	self:_heading("Sequences")
-	self:_caption(string.format("Intro: %d block(s)   Outro: %d block(s)", #scene.intro.segments, #scene.outro.segments))
-	self:_buttonRow({
-		{ text = "Edit Intro", onClick = function()
-			app:openSequenceOwner("intro")
-		end },
-		{ text = "Edit Outro", onClick = function()
-			app:openSequenceOwner("outro")
-		end },
-	})
+	self:_heading("Ordered subscenes")
+	for index, item in ipairs(scene.subscenes) do
+		self:_caption(string.format("%d. %s · %s · %d blocks", index, item.name, item.kind, #item.sequence.segments))
+		local actions = {
+			{ text = "Edit", onClick = function() app:openSequenceOwner("subscene", item.id) end },
+			{ text = "Up", onClick = function() app:moveSubscene(item.id, -1) end },
+			{ text = "Down", onClick = function() app:moveSubscene(item.id, 1) end },
+		}
+		if item.role == "custom" then
+			table.insert(actions, { text = "Delete", color = Theme.Danger, onClick = function()
+				app:showConfirm("Delete " .. item.name .. "?", "Its sequence and local interactions will be removed. Jumps and conditional routes to it will be cleared.", function()
+					app:deleteSubscene(item.id)
+				end)
+			end })
+		end
+		self:_buttonRow(actions)
+	end
+	self:_buttonRow({ { text = "+ Empty subscene", color = Theme.Accent, onClick = function() app:addSubscene() end } })
 
 	self:_heading("Project")
-	local pose = Schema.findCameraPose(project, scene.stage.cameraPoseId)
+	local pose = Schema.findCameraPose(project, Schema.effectivePoseId(scene, subscene))
 	self:_caption(string.format("Pose: %s   Lines: %d   Events: %d", pose and pose.name or "none", Schema.countLines(scene), Schema.countEvents(scene)))
+end
+
+function InspectorView:_renderAwaitRoutes(subscene)
+	local app = self.app
+	local scene = app.scene
+	self:_heading("On AWAIT")
+	self:_hint("Conditions are checked when this subscene first waits and each time an interaction returns it to AWAIT. Routes run top to bottom.")
+	local destinations = app:pickerItems("subscene")
+	for index, item in ipairs(destinations) do
+		if item.id == subscene.id then table.remove(destinations, index) break end
+	end
+	for routeIndex, route in ipairs(subscene.awaitRoutes) do
+		self:_caption("Conditional route " .. routeIndex)
+		self:_dropdownField("Destination", destinations, route.toSubsceneId, function(id)
+			route.toSubsceneId = id
+			route.transitionId = Schema.defaultSubsceneTransition(scene, subscene, id)
+			route.transitionExplicit = false
+			app:markDirty()
+		end, "(unassigned)")
+		self:_dropdownField("Transition", self:_subsceneTransitionItems(subscene, route.toSubsceneId), route.transitionId, function(id)
+			route.transitionId = id
+			route.transitionExplicit = true
+			app:markDirty()
+		end, "Fade to Black")
+		for conditionIndex, condition in ipairs(route.conditions) do
+			self:_dropdownField("Flag " .. conditionIndex, app:pickerItems("flag"), condition.flag, function(id)
+				condition.flag = id
+				app:markDirty()
+			end, "(choose flag)")
+			self:_choiceField("Operator", Schema.CONDITION_OPS, condition.op, function(op)
+				condition.op = op
+				app:markDirty()
+			end)
+			self:_textField("Value", condition.value, function(value)
+				condition.value = value
+				app:markDirty()
+			end)
+			self:_buttonRow({ { text = "Remove condition", color = Theme.Danger, onClick = function()
+				table.remove(route.conditions, conditionIndex)
+				app:markDirty()
+			end } })
+		end
+		self:_buttonRow({
+			{ text = "+ Condition", onClick = function()
+				local flags = app:pickerItems("flag")
+				if #flags == 0 then app:notify("Add a chapter or scene flag first.", Theme.Danger) return end
+				table.insert(route.conditions, { flag = flags[1].id, op = "==", value = "true" })
+				app:markDirty()
+			end },
+			{ text = "Delete route", color = Theme.Danger, onClick = function()
+				table.remove(subscene.awaitRoutes, routeIndex)
+				app:markDirty()
+			end },
+		})
+	end
+	self:_buttonRow({ { text = "+ Conditional route", onClick = function()
+		local flags = app:pickerItems("flag")
+		if #flags == 0 then app:notify("Add a chapter or scene flag first.", Theme.Danger) return end
+		table.insert(subscene.awaitRoutes, {
+			id = Schema.newId("route"),
+			conditions = { { flag = flags[1].id, op = "==", value = "true" } },
+			toSubsceneId = "", transitionId = Schema.DEFAULT_FADE, transitionExplicit = false,
+		})
+		app:markDirty()
+	end } })
 end
 
 function InspectorView:_renderPoseField(label, poseId, onPick)
@@ -320,6 +440,7 @@ end
 function InspectorView:_renderInteraction(interaction)
 	local app = self.app
 	local scene = app.scene
+	local subscene = app:getActiveSubscene()
 
 	self:_heading("Interaction")
 
@@ -338,7 +459,7 @@ function InspectorView:_renderInteraction(interaction)
 	end)
 
 	if interaction.kind == "Hotspot" then
-		self:_hint(scene.stage.kind == "Explore3D" and "Hotspot: the player gets a proximity prompt on the target." or "Hotspot: the player clicks the target.")
+		self:_hint(subscene.kind == "Explore3D" and "Hotspot: the player gets a proximity prompt on the target." or "Hotspot: the player clicks the target.")
 	elseif interaction.kind == "Trigger" then
 		self:_hint("Trigger: fires when the player touches the target (Explore3D) or clicks it (Room3D).")
 	else
@@ -361,6 +482,17 @@ function InspectorView:_renderInteraction(interaction)
 	})
 
 	self:_heading("Availability")
+	self:_choiceField("Scope", { "Local", "Shared" }, interaction.scope or "Shared", function(scope)
+		interaction.scope = scope
+		if scope == "Local" and interaction.subsceneId == "" then interaction.subsceneId = subscene.id end
+		app:markDirty()
+	end)
+	if interaction.scope == "Local" then
+		self:_dropdownField("Subscene", app:pickerItems("subscene"), interaction.subsceneId, function(id)
+			interaction.subsceneId = id
+			app:markDirty()
+		end, "(choose subscene)")
+	end
 	self:_choiceField("Repeat", Schema.REPEAT_POLICIES, interaction.repeatPolicy, function(policy)
 		interaction.repeatPolicy = policy
 		app:markDirty()
@@ -968,8 +1100,27 @@ end
 -- Event section
 --------------------------------------------------------------------------------
 
+-- A sequence owned by a subscene has a known runtime source. A Local
+-- interaction can also name its source. Shared interactions intentionally do
+-- not get Merge here: they may be invoked from several subscenes, so there is
+-- no single source/destination pair that can be validated at authoring time.
+function InspectorView:_eventSourceSubscene()
+	local app = self.app
+	if app.openSequence.owner == "subscene" then
+		return Schema.subsceneIndex(app.scene, app.openSequence.subsceneId)
+	end
+	if app.openSequence.owner == "interaction" then
+		local interaction = Schema.findInteraction(app.scene, app.openSequence.interactionId)
+		if interaction and interaction.scope == "Local" then
+			return Schema.subsceneIndex(app.scene, interaction.subsceneId)
+		end
+	end
+	return nil
+end
+
 function InspectorView:_renderEvent(event, anchorKind, segment)
 	local app = self.app
+	local gotoSubsceneSource = event.type == "FlowGotoSubscene" and self:_eventSourceSubscene() or nil
 
 	self:_heading(EventRegistry.category(event.type) .. "  .  " .. EventRegistry.displayName(event.type))
 
@@ -983,6 +1134,9 @@ function InspectorView:_renderEvent(event, anchorKind, segment)
 		self:_hint("Fires the moment this line appears.", 18)
 	else
 		self:_hint("Runs when the interaction's sequence finishes.", 18)
+	end
+	if event.type == "FlowGotoSubscene" and app.openSequence.owner == "interaction" and not gotoSubsceneSource then
+		self:_hint("Merge is unavailable for a Shared interaction because it can run from more than one subscene.")
 	end
 
 	if EventRegistry.isDurational(event.type) then
@@ -1020,8 +1174,18 @@ function InspectorView:_renderEvent(event, anchorKind, segment)
 		elseif field.kind == "picker" then
 			-- Camera pose only matters for Camera3D backgrounds.
 			if not (event.type == "BackgroundChange" and field.key == "poseId" and event.params.kind ~= "Camera3D") then
-				self:_dropdownField(field.label, app:pickerItems(field.picker), value, function(id)
+				local items = app:pickerItems(field.picker)
+				if event.type == "FlowGotoSubscene" and field.key == "transitionId" then
+					items = self:_subsceneTransitionItems(gotoSubsceneSource, event.params.subsceneId)
+				end
+				self:_dropdownField(field.label, items, value, function(id)
 					event.params[field.key] = id
+					if event.type == "FlowGotoSubscene" and field.key == "subsceneId" then
+						event.params.transitionId = Schema.defaultSubsceneTransition(app.scene, gotoSubsceneSource, id)
+						event.transitionExplicit = false
+					elseif event.type == "FlowGotoSubscene" and field.key == "transitionId" then
+						event.transitionExplicit = true
+					end
 					app:markDirty()
 				end, "(none)")
 

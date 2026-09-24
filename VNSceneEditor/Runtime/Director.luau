@@ -21,6 +21,7 @@ function Director.new(presenter, project)
 	self.project = project
 	self.chapter = nil
 	self.scene = nil
+	self.subscene = nil
 	self.phase = "Idle"
 	self.flags = {}
 	self.consumed = {} -- interactionId -> times completed
@@ -32,6 +33,7 @@ function Director.new(presenter, project)
 	self.runner = SequenceRunner.new(presenter)
 
 	self.SceneChanged = Signal.new() -- (scene)
+	self.SubsceneChanged = Signal.new() -- (subscene)
 	self.PhaseChanged = Signal.new() -- (phase)
 	self.FlagsChanged = Signal.new() -- (flags, changedIds | nil)
 	self.Finished = Signal.new() -- (reason)
@@ -62,6 +64,7 @@ end
 function Director:setChapter(chapter, flags)
 	self.chapter = chapter
 	self.scene = nil
+	self.subscene = nil
 	self.currentInteraction = nil
 	self.flags = Schema.normalizeFlagState(chapter, flags)
 	self.consumed = {}
@@ -103,6 +106,10 @@ function Director:getScene()
 	return self.scene
 end
 
+function Director:getSubscene()
+	return self.subscene
+end
+
 function Director:getRunner()
 	return self.runner
 end
@@ -123,6 +130,7 @@ function Director:serialize()
 		chapterId = self.chapter and self.chapter.id or "",
 		sceneId = self.scene and self.scene.id or "",
 		phase = self.phase,
+		subsceneId = self.subscene and self.subscene.id or "",
 		flags = Schema.deepCopy(self.flags),
 		consumed = Schema.deepCopy(self.consumed),
 	}
@@ -148,9 +156,9 @@ function Director:restore(state)
 	self.generation += 1
 
 	if state.phase == "Await" then
-		self:_enterScene(scene.id, nil, { skipIntro = true, sceneFlags = state.flags })
+		self:_enterScene(scene.id, nil, { skipIntro = true, sceneFlags = state.flags, subsceneId = state.subsceneId })
 	else
-		self:_enterScene(scene.id, nil, { sceneFlags = state.flags })
+		self:_enterScene(scene.id, nil, { sceneFlags = state.flags, subsceneId = state.subsceneId })
 	end
 
 	return true
@@ -184,6 +192,7 @@ function Director:stop()
 	self.generation += 1
 	self.active = false
 	self.currentInteraction = nil
+	self.subscene = nil
 	self.pendingFinish = nil
 	self.runner:stop()
 	self.presenter:setInteractables({})
@@ -206,7 +215,7 @@ end
 
 function Director:_runnerContext()
 	return {
-		scene = self.scene,
+		scene = self.subscene and Schema.subsceneView(self.scene, self.subscene) or self.scene,
 		chapter = self.chapter,
 		project = self.project,
 		flagsAreAuthoritative = true,
@@ -218,6 +227,14 @@ end
 
 -- Runs a transition preset around an apply callback. Yields until done.
 function Director:_transition(transitionId, apply, extra)
+	if transitionId == "Merge" then
+		if self.scene and self.subscene and extra
+			and Schema.isValidMergeBetween(self.scene, self.subscene, extra.targetSubsceneId) then
+			apply()
+			return
+		end
+		transitionId = Schema.DEFAULT_FADE
+	end
 	local preset = Schema.findTransition(self.project, transitionId)
 
 	if not preset then
@@ -228,7 +245,7 @@ function Director:_transition(transitionId, apply, extra)
 	local context = extra or {}
 	context.apply = apply
 	context.project = self.project
-	context.fromScene = self.scene
+	context.fromScene = self.presenter.scene or self.scene
 
 	self.presenter:runTransition(preset, context)
 end
@@ -241,6 +258,8 @@ function Director:_enterScene(sceneId, transitionId, options)
 		self:_finishChapter("missing-scene")
 		return
 	end
+	Schema.ensureSubscenes(scene)
+	local entrySubscene = Schema.subsceneIndex(scene, options.subsceneId) or scene.subscenes[1]
 
 	local generation = self.generation
 	self.runner:stop()
@@ -262,42 +281,98 @@ function Director:_enterScene(sceneId, transitionId, options)
 			end
 
 			self.scene = scene
+			self.subscene = nil
 			self.currentInteraction = nil
 			-- Scene flags have lexical scene scope: entering normally creates fresh
 			-- defaults and drops the previous scene's locals. Restore is the only
 			-- path that supplies saved local values.
 			self.flags = Schema.normalizeRuntimeFlagState(self.chapter, scene, self.flags, options.sceneFlags)
 			self.FlagsChanged:Fire(self.flags, nil)
-			self.presenter:enterScene(scene, self.project)
-			self.runner:setSequence(scene.intro, self:_runnerContext(), { silent = true })
 			self.SceneChanged:Fire(scene)
-		end, { toScene = scene })
+			self.subscene = entrySubscene
+			self.presenter:enterScene(Schema.subsceneView(scene, entrySubscene), self.project)
+			-- Prepare the destination environment beneath the overlay. Its dialogue
+			-- remains withheld until the transition has fully completed.
+			self.runner:setSequence(entrySubscene.sequence, self:_runnerContext(), { silent = true, backgroundOnly = true })
+			self.SubsceneChanged:Fire(entrySubscene)
+		end, { toScene = Schema.subsceneView(scene, entrySubscene) })
 
 		if generation ~= self.generation then
 			return
 		end
 
-		if options.skipIntro or #scene.intro.segments == 0 then
-			self:_onIntroFinished()
+		local subscene = self.subscene
+		if options.skipIntro or #subscene.sequence.segments == 0 then
+			self:_onSubsceneFinished()
 		else
 			self:_setPhase("PlayIntro")
-			self.pendingFinish = function()
-				self:_onIntroFinished()
-			end
+			self.pendingFinish = function() self:_onSubsceneFinished() end
 			self.runner:play(true)
 		end
 	end)
 end
 
-function Director:_onIntroFinished()
-	if not self.scene then
+function Director:_enterSubscene(subscene, transitionId, options)
+	options = options or {}
+	if not subscene then return false end
+	local generation = self.generation
+	local previousSnapshot = self.runner:getSnapshot()
+	self.runner:stop()
+	self.presenter:setInteractables({})
+	self:_setPhase("Transition")
+	task.spawn(function()
+		if transitionId ~= "Merge" then task.wait() end
+		if generation ~= self.generation then return end
+		local previous = self.subscene
+		local merging = transitionId == "Merge" and previous ~= nil
+			and Schema.isValidMergeBetween(self.scene, previous, subscene)
+		self:_transition(transitionId, function()
+			if generation ~= self.generation then return end
+			self.subscene = subscene
+			self.currentInteraction = nil
+			local view = Schema.subsceneView(self.scene, subscene)
+			if merging then
+				-- A Merge keeps the visible environment produced by the previous
+				-- sequence, including any background or camera events it ran.
+				if previousSnapshot then
+					view.background = {
+						kind = previousSnapshot.background.kind,
+						value = previousSnapshot.background.value,
+						poseId = previousSnapshot.background.poseId,
+					}
+					view.stage.cameraPoseId = previousSnapshot.cameraPoseId or ""
+				end
+				self.presenter:refreshScene(view, self.project)
+				self.presenter:getWorld():clear()
+			else
+				self.presenter:enterScene(view, self.project)
+			end
+			self.runner:setSequence(subscene.sequence, self:_runnerContext(), { silent = true, backgroundOnly = true })
+			self.SubsceneChanged:Fire(subscene)
+		end, { toScene = Schema.subsceneView(self.scene, subscene), targetSubsceneId = subscene.id })
+		if generation ~= self.generation then return end
+		if options.skipSequence or #subscene.sequence.segments == 0 then
+			self:_onSubsceneFinished()
+		else
+			self:_setPhase("PlayIntro")
+			self.pendingFinish = function() self:_onSubsceneFinished() end
+			self.runner:play(true)
+		end
+	end)
+	return true
+end
+
+function Director:_onSubsceneFinished()
+	if not self.scene or not self.subscene then return end
+	if self.subscene.kind ~= "Novel2D" then
+		self:_await()
 		return
 	end
-
-	if self.scene.stage.kind == "Novel2D" then
-		self:_leaveScene(self.scene.next.sceneId, self.scene.next.transitionId)
+	local nextSubscene = Schema.nextAutomaticSubscene(self.scene, self.subscene)
+	if nextSubscene then
+		self:_enterSubscene(nextSubscene, self.subscene.nextTransitionId)
 	else
-		self:_await()
+		self:_leaveScene(self.scene.next.sceneId, self.scene.next.transitionId)
 	end
 end
 
@@ -305,6 +380,16 @@ function Director:_await()
 	self:_setPhase("Await")
 	self.runner:stop()
 	self:_refreshInteractables()
+	for _, route in ipairs(self.subscene and self.subscene.awaitRoutes or {}) do
+		if route.toSubsceneId ~= "" and #route.conditions > 0
+			and Conditions.evaluate(route.conditions, self.flags, self.chapter, self.scene) then
+			local target = Schema.subsceneIndex(self.scene, route.toSubsceneId)
+			if target and target.id ~= self.subscene.id then
+				self:_enterSubscene(target, route.transitionId)
+				return
+			end
+		end
+	end
 end
 
 function Director:_refreshInteractables()
@@ -334,10 +419,13 @@ function Director:_leaveScene(nextSceneId, transitionId)
 
 	self.presenter:setInteractables({})
 
-	if self.scene and #self.scene.outro.segments > 0 then
+	local legacyOutro = self.scene and self.scene.subscenes and #self.scene.subscenes == 2
+		and self.scene.subscenes[2].role == "outro" and self.subscene == self.scene.subscenes[1]
+		and self.subscene.kind ~= "Novel2D" and self.scene.subscenes[2]
+	if legacyOutro and #legacyOutro.sequence.segments > 0 then
 		self:_setPhase("PlayOutro")
 		self.pendingFinish = proceed
-		self.runner:setSequence(self.scene.outro, self:_runnerContext(), { silent = true })
+		self.runner:setSequence(legacyOutro.sequence, self:_runnerContext(), { silent = true })
 		self.runner:play(true)
 	else
 		proceed()
@@ -361,6 +449,7 @@ function Director:_onEvents(events)
 	local flagsChanged = false
 	local changedFlagIds = {}
 	local gotoParams = nil
+	local gotoSubsceneParams = nil
 	local endChapter = false
 
 	for _, event in ipairs(events) do
@@ -369,6 +458,8 @@ function Director:_onEvents(events)
 			changedFlagIds[event.params.flag] = true
 		elseif event.type == "FlowGoto" then
 			gotoParams = event.params
+		elseif event.type == "FlowGotoSubscene" then
+			gotoSubsceneParams = event.params
 		elseif event.type == "FlowEndChapter" then
 			endChapter = true
 		end
@@ -390,6 +481,13 @@ function Director:_onEvents(events)
 		self.pendingFinish = nil
 		self.runner:stop()
 		self:_leaveScene(gotoParams.sceneId, gotoParams.transitionId)
+	elseif gotoSubsceneParams then
+		local target = Schema.subsceneIndex(self.scene, gotoSubsceneParams.subsceneId)
+		if target then
+			self.pendingFinish = nil
+			self.runner:stop()
+			self:_enterSubscene(target, gotoSubsceneParams.transitionId)
+		end
 	end
 end
 
@@ -398,6 +496,7 @@ end
 --------------------------------------------------------------------------------
 
 function Director:isInteractionAvailable(interaction)
+	if not Schema.interactionInSubscene(self.scene, self.subscene, interaction) then return false end
 	if interaction.repeatPolicy == "once" and (self.consumed[interaction.id] or 0) > 0 then
 		return false
 	end
@@ -414,10 +513,12 @@ function Director:availableInteractions()
 	end
 
 	for _, interaction in ipairs(self.scene.interactions) do
-		table.insert(list, {
-			interaction = interaction,
-			available = self:isInteractionAvailable(interaction),
-		})
+		if Schema.interactionInSubscene(self.scene, self.subscene, interaction) then
+			table.insert(list, {
+				interaction = interaction,
+				available = self:isInteractionAvailable(interaction),
+			})
+		end
 	end
 
 	return list
@@ -484,6 +585,7 @@ function Director:_completeInteraction(interaction)
 
 	-- onComplete flow events (flags, gotoParams, end).
 	local gotoParams = nil
+	local gotoSubsceneParams = nil
 	local endChapter = false
 	local flagsChanged = false
 	local changedFlagIds = {}
@@ -494,6 +596,8 @@ function Director:_completeInteraction(interaction)
 			changedFlagIds[event.params.flag] = true
 		elseif event.type == "FlowGoto" then
 			gotoParams = event.params
+		elseif event.type == "FlowGotoSubscene" then
+			gotoSubsceneParams = event.params
 		elseif event.type == "FlowEndChapter" then
 			endChapter = true
 		end
@@ -536,6 +640,9 @@ function Director:_completeInteraction(interaction)
 			self:_finishChapter("end")
 		elseif gotoParams then
 			self:_leaveScene(gotoParams.sceneId, gotoParams.transitionId)
+		elseif gotoSubsceneParams then
+			local target = Schema.subsceneIndex(self.scene, gotoSubsceneParams.subsceneId)
+			if target then self:_enterSubscene(target, gotoSubsceneParams.transitionId) else self:_await() end
 		elseif interaction.kind == "Exit" then
 			self:_leaveScene(interaction.exit.sceneId, interaction.exit.transitionId)
 		else
@@ -566,6 +673,7 @@ function Director:destroy()
 	end
 	self.runner:destroy()
 	self.SceneChanged:DisconnectAll()
+	self.SubsceneChanged:DisconnectAll()
 	self.PhaseChanged:DisconnectAll()
 	self.FlagsChanged:DisconnectAll()
 	self.Finished:DisconnectAll()

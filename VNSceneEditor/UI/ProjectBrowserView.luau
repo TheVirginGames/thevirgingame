@@ -205,15 +205,19 @@ function ProjectBrowserView:_renderChapters()
 
 		local kinds = { Novel2D = 0, Room3D = 0, Explore3D = 0 }
 		local lines = 0
+		local subsceneCount = 0
 		for _, scene in ipairs(chapter.scenes) do
-			kinds[scene.stage.kind] += 1
+			for _, subscene in ipairs(Schema.ensureSubscenes(scene)) do
+				kinds[subscene.kind] += 1
+				subsceneCount += 1
+			end
 			lines += Schema.countLines(scene)
 		end
 
 		Widgets.label({
 			Text = string.format(
-				"%d scene(s): %d novel, %d room, %d explore   .   %d line(s)   .   %d flag(s)",
-				#chapter.scenes, kinds.Novel2D, kinds.Room3D, kinds.Explore3D, lines, #chapter.flags
+				"%d scene(s), %d subscene(s): %d novel, %d room, %d explore   .   %d line(s)   .   %d flag(s)",
+				#chapter.scenes, subsceneCount, kinds.Novel2D, kinds.Room3D, kinds.Explore3D, lines, #chapter.flags
 			),
 			Position = UDim2.new(0, 40, 0, 30),
 			Size = UDim2.new(1, -60, 0, 16),

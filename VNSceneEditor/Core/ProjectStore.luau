@@ -30,6 +30,7 @@ end
 --------------------------------------------------------------------------------
 
 function ProjectStore.getProject()
+	Schema.ensureDefaults(project)
 	return project
 end
 
@@ -238,7 +239,9 @@ end
 
 function ProjectStore.getScene(chapterId, sceneId)
 	local chapter = Schema.findChapter(project, chapterId)
-	return Schema.findScene(chapter, sceneId), chapter
+	local scene = Schema.findScene(chapter, sceneId)
+	if scene then Schema.ensureSubscenes(scene) end
+	return scene, chapter
 end
 
 function ProjectStore.createScene(chapterId, name, kind, position)
@@ -248,6 +251,7 @@ function ProjectStore.createScene(chapterId, name, kind, position)
 	end
 
 	local scene = Schema.newScene(name, kind)
+	Schema.ensureSubscenes(scene)
 	if position then
 		scene.flow = { x = position.x, y = position.y }
 	else
@@ -298,7 +302,8 @@ function ProjectStore.setSceneNext(chapterId, sceneId, destinationSceneId)
 	local chapter = Schema.findChapter(project, chapterId)
 	local scene = Schema.findScene(chapter, sceneId)
 
-	if not scene or scene.stage.kind ~= "Novel2D" or not isSceneDestination(chapter, sceneId, destinationSceneId) then
+	local subscenes = scene and Schema.ensureSubscenes(scene)
+	if not scene or subscenes[#subscenes].kind ~= "Novel2D" or not isSceneDestination(chapter, sceneId, destinationSceneId) then
 		return false
 	end
 
@@ -311,7 +316,8 @@ function ProjectStore.setSceneNextTransition(chapterId, sceneId, transitionId)
 	local chapter = Schema.findChapter(project, chapterId)
 	local scene = Schema.findScene(chapter, sceneId)
 
-	if not scene or scene.stage.kind ~= "Novel2D" then
+	local subscenes = scene and Schema.ensureSubscenes(scene)
+	if not scene or subscenes[#subscenes].kind ~= "Novel2D" then
 		return false
 	end
 
@@ -461,6 +467,8 @@ function ProjectStore.commit(chapterId, scene)
 
 	local _, index = Schema.findScene(chapter, scene.id)
 	local stored = Schema.deepCopy(scene)
+	Schema.ensureSubscenes(stored)
+	Schema.reconcileSubscenes(stored)
 
 	if index then
 		chapter.scenes[index] = stored

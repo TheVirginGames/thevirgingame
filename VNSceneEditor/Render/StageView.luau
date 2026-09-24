@@ -1183,7 +1183,7 @@ function StageView:_playSequentialOut(
 	return actualStart + duration
 end
 
-function StageView:_playIn(preset)
+function StageView:_playIn(preset, showSpeakerChrome)
 	self:_cancelElementTweens()
 	self:_cancelSpeakingExit(true)
 	-- Let the rectangle's existing reverse fade carry the prompt out with it.
@@ -1219,6 +1219,20 @@ function StageView:_playIn(preset)
 			0.25,
 			true
 		)
+
+	-- Narration has no speaker identity. Let the dialogue box enter, but keep
+	-- the entire authored top-bar group out of the render tree so Pinkbar,
+	-- SPEAKING, and Name cannot animate in.
+	if not showSpeakerChrome then
+		self.bars.Visible = false
+		self.pinkBar.Visible = false
+		self.namePlate.Visible = false
+		self.speaking.Visible = false
+		self.speakingPulseDelay = math.huge
+		self.typewriterDelay = boxEnd
+		self.textLabel.MaxVisibleGraphemes = 0
+		return
+	end
 
 	----------------------------------------------------------------------
 	-- 2. PINKBAR
@@ -1309,15 +1323,27 @@ end
 
 -- Replays only the speaker-specific portion of the standard entrance. The
 -- rectangle stays fully visible and at its authored resting position.
-function StageView:_playMergedSpeakerIn(preset, animateSpeaking)
+function StageView:_playMergedSpeakerIn(preset, animateSpeaking, showSpeakerChrome)
 	self:_cancelElementTweens()
 	self:_cancelSpeakingExit(true)
 	self.boxHiddenByOut = false
 	self.dialogueBox.Visible = true
 	self.dialogueBox.Position = self.rest.box.position
 	self:_setVisualTransparency(self.rest.box, 0)
-	self.bars.Visible = true
 	self.bars.Position = self.rest.bars.position
+
+	if not showSpeakerChrome then
+		self.bars.Visible = false
+		self.pinkBar.Visible = false
+		self.namePlate.Visible = false
+		self.speaking.Visible = false
+		self.speakingPulseDelay = math.huge
+		self.typewriterDelay = 0
+		self.textLabel.MaxVisibleGraphemes = 0
+		return
+	end
+
+	self.bars.Visible = true
 	self.pinkBar.Visible = true
 
 	local nameAnim = table.clone(preset.elements.namePlate or {})
@@ -1494,6 +1520,7 @@ function StageView:requestAdvance(merge)
 		preset.elements.namePlate or {}
 	local speakingAnim =
 		preset.elements.speaking or nameAnim
+	local hasSpeakerChrome = self.bars.Visible
 
 	----------------------------------------------------------------------
 	-- 1. TEXT
@@ -1522,13 +1549,15 @@ function StageView:requestAdvance(merge)
 		-- except the text is left untouched. If the prior line was interrupted
 		-- during its entrance, settle its speaker elements first instead of
 		-- preserving a cancelled half-transparent tween state.
-		local shouldExitSpeaking = self.pendingDialogueMerge.sameSpeaker
+		local shouldExitSpeaking = hasSpeakerChrome
+			and self.pendingDialogueMerge.sameSpeaker
 			and self.pendingDialogueMerge.fromSpeaking
 			and not self.pendingDialogueMerge.toSpeaking
 
-		if self.pendingDialogueMerge.sameSpeaker then
+		if self.pendingDialogueMerge.sameSpeaker and hasSpeakerChrome then
 			self:_settleSpeakerElements(self.speaking.Visible)
 		else
+			self.bars.Visible = false
 			self.pinkBar.Visible = false
 			self.namePlate.Visible = false
 			self.speaking.Visible = false
@@ -1556,7 +1585,7 @@ function StageView:requestAdvance(merge)
 
 	local sequenceEnd = 0
 
-	if self.namePlate.Visible then
+	if hasSpeakerChrome and self.namePlate.Visible then
 		sequenceEnd =
 			self:_playSequentialOut(
 				self.namePlate,
@@ -1576,26 +1605,21 @@ function StageView:requestAdvance(merge)
 	----------------------------------------------------------------------
 
 	local pinkBarStart = sequenceEnd
-	sequenceEnd =
-		self:_playSequentialOut(
+	if hasSpeakerChrome then
+		sequenceEnd = self:_playSequentialOut(
 			self.pinkBar,
 			self.rest.pinkBar,
 			nameAnim,
 			pinkBarStart,
-			UDim2.new(
-				0,
-				0,
-				0,
-				40
-			),
+			UDim2.new(0, 0, 0, 40),
 			0.2,
 			true
 		)
 
-	if self.speaking.Visible then
-		sequenceEnd = math.max(
-			sequenceEnd,
-			self:_playSequentialOut(
+		if self.speaking.Visible then
+			sequenceEnd = math.max(
+				sequenceEnd,
+				self:_playSequentialOut(
 				self.speaking,
 				self.rest.speaking,
 				speakingAnim,
@@ -1604,7 +1628,8 @@ function StageView:requestAdvance(merge)
 				0.2,
 				true
 			)
-		)
+			)
+		end
 	end
 
 	----------------------------------------------------------------------
@@ -1695,36 +1720,31 @@ function StageView:_renderDialogue(
 	self.dialogueBox.Visible =
 		true
 
-	self.bars.Visible =
-		true
-
 	local characterName =
 		dialogue.character or ""
+	local hasSpeakerChrome = string.match(characterName, "%S") ~= nil
 	local isSpeaking = dialogue.speaking ~= false
+	self.bars.Visible = hasSpeakerChrome
 	local textColor = isSpeaking and self.templateTextColor or Color3.fromRGB(108, 202, 214)
-	local textStrokeColor 
-	if textColor == Color3.fromRGB(108, 202, 214) then
-		textStrokeColor = Color3.fromRGB(84, 159, 167)
-	end
 	self.textLabel.TextColor3 = textColor
-	self.textLabel.TextStrokeColor3 = isSpeaking and textStrokeColor or self.nonSpeakingTextStrokeColor
+	self.textLabel.TextStrokeColor3 = isSpeaking and self.templateTextStrokeColor or self.nonSpeakingTextStrokeColor
 
 	-- Inspector preview updates can change this property without creating a new
 	-- entry id. Keep the preview faithful instead of requiring a replay.
-	if dialogue.entryId == self.lastEntryId and self.currentSpeaking ~= isSpeaking then
+	if dialogue.entryId == self.lastEntryId and self.currentSpeaking ~= (hasSpeakerChrome and isSpeaking) then
 		self:_stopSpeakingTextPulse(true)
 		self:_cancelSpeakingExit(true)
-		self.currentSpeaking = isSpeaking
-		self.speaking.Visible = isSpeaking
-		if isSpeaking then
+		self.currentSpeaking = hasSpeakerChrome and isSpeaking
+		self.speaking.Visible = hasSpeakerChrome and isSpeaking
+		if hasSpeakerChrome and isSpeaking then
 			self:_playMergedSpeakingIn(preset)
 		else
 			self.speakingPulseDelay = math.huge
 		end
 	end
 
-	self.namePlate.Visible =
-		characterName ~= ""
+	self.namePlate.Visible = hasSpeakerChrome
+	self.pinkBar.Visible = hasSpeakerChrome
 
 	self.nameLabel.Text =
 		characterName
@@ -1749,8 +1769,8 @@ function StageView:_renderDialogue(
 		self.pendingDialogueMerge = nil
 		self:_stopLeftClickPulse(true, true)
 		self:_stopSpeakingTextPulse(true)
-		self.speaking.Visible = isSpeaking or preservingSpeakingExit
-		self.currentSpeaking = isSpeaking
+		self.speaking.Visible = hasSpeakerChrome and (isSpeaking or preservingSpeakingExit)
+		self.currentSpeaking = hasSpeakerChrome and isSpeaking
 
 		self.lastEntryId =
 			dialogue.entryId
@@ -1759,7 +1779,7 @@ function StageView:_renderDialogue(
 			false
 
 		if isMerge then
-			if merge.sameSpeaker then
+			if merge.sameSpeaker and hasSpeakerChrome then
 				-- Same-character consecutive lines retain every piece of the
 				-- existing dialogue UI and immediately start the new typewriter.
 				self.boxHiddenByOut = false
@@ -1776,10 +1796,10 @@ function StageView:_renderDialogue(
 				-- A changed character refreshes the entire top bar. The badge is
 				-- deliberately included even when the prior line was speaking, so
 				-- it cannot be left behind while Pinkbar and Name animate in.
-				self:_playMergedSpeakerIn(preset, merge.toSpeaking)
+				self:_playMergedSpeakerIn(preset, merge.toSpeaking, hasSpeakerChrome)
 			end
 		else
-			self:_playIn(preset)
+			self:_playIn(preset, hasSpeakerChrome)
 		end
 	end
 

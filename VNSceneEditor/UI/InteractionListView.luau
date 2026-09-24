@@ -75,6 +75,8 @@ end
 function InteractionListView:_add(kind)
 	local app = self.app
 	local interaction = Schema.newInteraction(kind)
+	interaction.scope = "Local"
+	interaction.subsceneId = app:getActiveSubscene().id
 	table.insert(app.scene.interactions, interaction)
 	app:setSelection({ kind = "interaction", interactionId = interaction.id })
 	app:markDirty()
@@ -107,7 +109,8 @@ function InteractionListView:render()
 	for index, interaction in ipairs(scene.interactions) do
 		local isSelected = app.selection.kind == "interaction" and app.selection.interactionId == interaction.id
 		local isOpen = app.openSequence.owner == "interaction" and app.openSequence.interactionId == interaction.id
-		local available = Conditions.evaluate(interaction.conditions, flags, chapter, scene)
+		local inScope = Schema.interactionInSubscene(scene, app:getActiveSubscene(), interaction)
+		local available = inScope and Conditions.evaluate(interaction.conditions, flags, chapter, scene)
 
 		local row = Widgets.button({
 			Name = "Interaction_" .. interaction.id,
@@ -145,7 +148,7 @@ function InteractionListView:render()
 		})
 
 		Widgets.label({
-			Text = string.upper(interaction.kind) .. (interaction.repeatPolicy == "once" and "  .  once" or "  .  repeat"),
+			Text = string.upper(interaction.kind) .. (interaction.scope == "Local" and " · local" or " · shared"),
 			AnchorPoint = Vector2.new(1, 0),
 			Position = UDim2.new(1, -8, 0, 6),
 			Size = UDim2.new(0, 96, 0, 14),
@@ -172,7 +175,8 @@ function InteractionListView:render()
 		})
 
 		Widgets.label({
-			Text = "if " .. Conditions.describeAll(interaction.conditions) .. (available and "" or "   (blocked by preview flags)"),
+			Text = "if " .. Conditions.describeAll(interaction.conditions)
+				.. (inScope and (available and "" or "   (blocked by preview flags)") or "   (other subscene)"),
 			Position = UDim2.new(0, 12, 0, 37),
 			Size = UDim2.new(1, -110, 0, 14),
 			TextSize = 10,
@@ -211,10 +215,10 @@ function InteractionListView:render()
 			LayoutOrder = 2,
 			OnClick = function()
 				app:showConfirm("Delete interaction?", "Its sequence and events are removed from this scene.", function()
+					local wasOpen = app.openSequence.owner == "interaction" and app.openSequence.interactionId == interaction.id
+					local returnSubsceneId = app:getActiveSubscene().id
 					table.remove(scene.interactions, index)
-					if app.openSequence.owner == "interaction" and app.openSequence.interactionId == interaction.id then
-						app.openSequence = { owner = "intro" }
-					end
+					if wasOpen then app:openSequenceOwner("subscene", returnSubsceneId) end
 					app:setSelection({ kind = "scene" })
 					app:markDirty()
 				end)

@@ -71,7 +71,36 @@ local function encode(value, pretty)
 	return prettyPrint(result)
 end
 
+local function stripLegacyScene(scene)
+	Schema.ensureSubscenes(scene)
+	-- These legacy fields are only an import path. The ordered subscenes
+	-- are the single persisted source for environment and sequence data.
+	scene.intro = nil
+	scene.outro = nil
+	scene.stage = nil
+	scene.background = nil
+end
+
+local function serializableChapter(chapter)
+	local copy = Schema.deepCopy(chapter)
+	for _, scene in ipairs(copy.scenes or {}) do
+		stripLegacyScene(scene)
+	end
+	return copy
+end
+
 local function projectEnvelope(project)
+	local chapters = {}
+	for _, chapter in ipairs(project.chapters or {}) do
+		table.insert(chapters, serializableChapter(chapter))
+	end
+	local recycleBin = Schema.deepCopy(project.recycleBin or Schema.emptyRecycleBin())
+	for _, item in ipairs(recycleBin.chapters or {}) do
+		for _, scene in ipairs(item.chapter and item.chapter.scenes or {}) do stripLegacyScene(scene) end
+	end
+	for _, item in ipairs(recycleBin.scenes or {}) do
+		if item.scene then stripLegacyScene(item.scene) end
+	end
 	return {
 		formatVersion = Schema.FORMAT_VERSION,
 		name = project.name,
@@ -80,8 +109,8 @@ local function projectEnvelope(project)
 		textboxPresets = project.textboxPresets or {},
 		transitionPresets = project.transitionPresets or {},
 		portraitLayout = Schema.normalizePortraitLayout(project.portraitLayout),
-		chapters = project.chapters or {},
-		recycleBin = project.recycleBin or Schema.emptyRecycleBin(),
+		chapters = chapters,
+		recycleBin = recycleBin,
 	}
 end
 
@@ -94,7 +123,7 @@ end
 function JSONCodec.encodeChapter(project, chapter, pretty)
 	local envelope = projectEnvelope(project)
 	envelope.name = chapter.name
-	envelope.chapters = { chapter }
+	envelope.chapters = { serializableChapter(chapter) }
 	envelope.recycleBin = Schema.emptyRecycleBin()
 	return encode(envelope, pretty)
 end

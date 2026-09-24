@@ -188,7 +188,9 @@ function RecycleBinView:render()
 		for _, item in ipairs(bin.scenes) do
 			order += 1
 			local chapter = ProjectStore.getChapter(item.chapterId)
-			self:_row(order, item.scene.name, string.format("%s  .  %d line(s)  .  from %s  .  deleted %s", item.scene.stage.kind, Schema.countLines(item.scene), chapter and chapter.name or "a deleted chapter", formatAge(item.deletedAt)), function()
+			local subscenes = Schema.ensureSubscenes(item.scene)
+			local kinds = subscenes[1].kind .. (subscenes[1].kind ~= subscenes[#subscenes].kind and (" → " .. subscenes[#subscenes].kind) or "")
+			self:_row(order, item.scene.name, string.format("%s  .  %d line(s)  .  from %s  .  deleted %s", kinds, Schema.countLines(item.scene), chapter and chapter.name or "a deleted chapter", formatAge(item.deletedAt)), function()
 				ProjectStore.restoreScene(item.id)
 				app:notify("Scene restored.", Theme.Good)
 				app:refresh()

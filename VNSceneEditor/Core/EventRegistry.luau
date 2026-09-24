@@ -8,7 +8,7 @@
 --
 -- Field kinds:
 --   string | number | boolean | choice (choices = {...})
---   picker  (picker = "scene" | "flag" | "pose" | "transition" | "textbox" | "character")
+--   picker  (picker = "scene" | "subscene" | "flag" | "pose" | "transition" | "textbox" | "character")
 --
 -- anchors: Timed (a second inside a timed segment), Dialogue (a dialogue entry),
 -- Complete (an interaction's onComplete list).
@@ -150,6 +150,16 @@ local definitions = {
 			{ key = "transitionId", label = "Transition", kind = "picker", picker = "transition", default = "" },
 		},
 	},
+	FlowGotoSubscene = {
+		displayName = "Go to Subscene",
+		category = "Flow",
+		color = Color3.fromRGB(255, 176, 110),
+		anchors = ALL,
+		fields = {
+			{ key = "subsceneId", label = "Subscene", kind = "picker", picker = "subscene", default = "" },
+			{ key = "transitionId", label = "Transition", kind = "picker", picker = "transition", default = "tr_fadeblack" },
+		},
+	},
 	FlowEndChapter = {
 		displayName = "End Chapter",
 		category = "Flow",
@@ -173,6 +183,7 @@ local order = {
 	"FlowSetFlag",
 	"FlowIncrement",
 	"FlowGoto",
+	"FlowGotoSubscene",
 	"FlowEndChapter",
 }
 

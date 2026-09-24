@@ -44,7 +44,7 @@ function EditorApp.new(playerGui)
 	self.scene = nil
 	self.dirty = false
 	self.selection = { kind = "scene" }
-	self.openSequence = { owner = "intro" }
+	self.openSequence = { owner = "subscene" }
 	self.sceneSettingsDefault = true
 	self.previewFlags = {}
 	self.previewFlagOverrides = {}
@@ -417,13 +417,18 @@ function EditorApp:_connectSignals()
 	end)
 
 	self.director.SceneChanged:Connect(function(scene)
-		self.playLabel.Text = string.format("Playing  .  %s  (%s)", scene.name, scene.stage.kind)
+		self.playLabel.Text = string.format("Playing  .  %s", scene.name)
+	end)
+	self.director.SubsceneChanged:Connect(function(subscene)
+		self.playLabel.Text = string.format("Playing  .  %s / %s  (%s)", self.director:getScene().name, subscene.name, subscene.kind)
 	end)
 
 	self.director.PhaseChanged:Connect(function(phase)
 		if self.director:isActive() and self.director:getScene() then
 			local scene = self.director:getScene()
-			self.playLabel.Text = string.format("Playing  .  %s  (%s)  .  %s", scene.name, scene.stage.kind, phase)
+			local subscene = self.director:getSubscene()
+			self.playLabel.Text = string.format("Playing  .  %s / %s  (%s)  .  %s", scene.name,
+				subscene and subscene.name or "...", subscene and subscene.kind or "...", phase)
 			self.presenter:setAdvanceHint(phase == "Await" and "" or "click to continue")
 		end
 	end)
@@ -565,14 +570,14 @@ function EditorApp:_refreshTopBar()
 	local items = {}
 	for _, item in ipairs(Schema.sequencesOf(self.scene)) do
 		table.insert(items, {
-			id = item.owner .. ":" .. (item.interactionId or ""),
+			id = item.owner .. ":" .. (item.interactionId or item.subsceneId or ""),
 			label = item.label .. string.format("  (%d)", #item.sequence.segments),
 		})
 	end
 
 	Widgets.dropdown(self.gui, {
 		Items = items,
-		Value = self.openSequence.owner .. ":" .. (self.openSequence.interactionId or ""),
+		Value = self.openSequence.owner .. ":" .. (self.openSequence.interactionId or self.openSequence.subsceneId or ""),
 		Size = UDim2.new(1, 0, 1, 0),
 		OnPick = function(id)
 			local owner, interactionId = id:match("^(%w+):(.*)$")
@@ -605,7 +610,8 @@ function EditorApp:refresh()
 	self:_refreshTopBar()
 	self.timelineView:render()
 
-	local showInteractions = self.scene.stage.kind ~= "Novel2D" and (self.selection.kind == "scene" or self.selection.kind == "interaction")
+	local activeSubscene = self:getActiveSubscene()
+	local showInteractions = activeSubscene and activeSubscene.kind ~= "Novel2D" and (self.selection.kind == "scene" or self.selection.kind == "interaction")
 	self.interactionListView:setVisible(showInteractions)
 	self.dialogueListView:setVisible(not showInteractions)
 
@@ -660,17 +666,20 @@ function EditorApp:openScene(chapterId, sceneId)
 	end
 
 	self.scene = scene
+	Schema.ensureSubscenes(scene)
+	self.lastSubsceneId = scene.subscenes[1].id
 	self.dirty = false
 	self.mode = "scene"
 	self.selection = { kind = "scene" }
-	self.openSequence = { owner = "intro" }
+	self.openSequence = { owner = "subscene", subsceneId = scene.subscenes[1].id }
 	self.sceneSettingsDefault = true
 
-	self.presenter:enterScene(scene, self:getProject())
+	self.presenter:enterScene(Schema.subsceneView(scene, scene.subscenes[1]), self:getProject())
 	self.runner:setSequence(self:getSequence(), self:_runnerContext(), { silent = true })
 
 	self:_applyMode()
 	self:refresh()
+	for _, warning in ipairs(Schema.takeWarnings(scene.id)) do self:notify(warning, Theme.Danger) end
 end
 
 -- Used by flow-graph links to reveal the exact timeline/on-completion effect
@@ -681,7 +690,7 @@ function EditorApp:openFlowEvent(chapterId, sceneId, link)
 		return
 	end
 
-	self:openSequenceOwner(link.owner or "intro", link.interactionId)
+	self:openSequenceOwner(link.owner or "subscene", link.interactionId or link.subsceneId)
 
 	local anchor = link.anchor or {}
 	local selection = {
@@ -772,6 +781,12 @@ function EditorApp:saveNow()
 end
 
 function EditorApp:markDirty()
+	if self.scene then
+		for _, warning in ipairs(Schema.reconcileSubscenes(self.scene)) do
+			self:notify(warning, Theme.Danger)
+		end
+		Schema.takeWarnings(self.scene.id)
+	end
 	self.dirty = true
 	self:refresh()
 end
@@ -798,6 +813,10 @@ function EditorApp:pickerItems(kind, excludeId)
 			if scene.id ~= excludeId then
 				table.insert(items, { id = scene.id, label = scene.name })
 			end
+		end
+	elseif kind == "subscene" then
+		for _, subscene in ipairs(self.scene and self.scene.subscenes or {}) do
+			table.insert(items, { id = subscene.id, label = subscene.name .. " · " .. subscene.kind })
 		end
 	elseif kind == "flag" then
 		local chapter = self:getChapter()
@@ -854,16 +873,20 @@ function EditorApp:getSequence()
 		return { segments = {} }
 	end
 
-	local sequence = Schema.getSequence(self.scene, self.openSequence.owner, self.openSequence.interactionId)
+	local sequence = Schema.getSequence(self.scene, self.openSequence.owner, self.openSequence.interactionId or self.openSequence.subsceneId)
 	if not sequence then
-		self.openSequence = { owner = "intro" }
-		sequence = self.scene.intro
+		self.openSequence = { owner = "subscene", subsceneId = self.scene.subscenes[1].id }
+		sequence = self.scene.subscenes[1].sequence
 	end
 
 	return sequence
 end
 
 function EditorApp:getSequenceLabel()
+	if self.openSequence.owner == "subscene" then
+		local subscene = self:getActiveSubscene()
+		return subscene and subscene.name or "Subscene"
+	end
 	if self.openSequence.owner == "interaction" then
 		local interaction = Schema.findInteraction(self.scene, self.openSequence.interactionId)
 		return interaction and interaction.name or "Interaction"
@@ -871,11 +894,26 @@ function EditorApp:getSequenceLabel()
 	return self.openSequence.owner == "outro" and "Outro" or "Intro"
 end
 
+function EditorApp:getActiveSubscene()
+	if not self.scene then return nil end
+	if self.openSequence.owner == "subscene" then
+		return Schema.subsceneIndex(self.scene, self.openSequence.subsceneId) or self.scene.subscenes[1]
+	end
+	local interaction = Schema.findInteraction(self.scene, self.openSequence.interactionId)
+	return (interaction and Schema.subsceneIndex(self.scene, interaction.subsceneId))
+		or Schema.subsceneIndex(self.scene, self.lastSubsceneId) or self.scene.subscenes[1]
+end
+
 function EditorApp:openSequenceOwner(owner, interactionId)
-	self.openSequence = { owner = owner, interactionId = interactionId }
+	if self.openSequence.owner == "subscene" then self.lastSubsceneId = self.openSequence.subsceneId end
+	self.openSequence = owner == "subscene"
+		and { owner = owner, subsceneId = interactionId }
+		or { owner = owner, interactionId = interactionId }
 	self.sceneSettingsDefault = false
 
 	local sequence = self:getSequence()
+	local subscene = self:getActiveSubscene()
+	if subscene then self.presenter:enterScene(Schema.subsceneView(self.scene, subscene), self:getProject()) end
 	local first = sequence.segments[1]
 	self.selection = first and { kind = "segment", segmentIndex = 1 } or { kind = "scene" }
 
@@ -883,10 +921,60 @@ function EditorApp:openSequenceOwner(owner, interactionId)
 	self:refresh()
 end
 
+function EditorApp:addSubscene()
+	local current = self:getActiveSubscene()
+	local subscene = Schema.newSubscene("Subscene " .. (#self.scene.subscenes + 1), current and current.kind or "Novel2D")
+	local index = nil
+	if current then
+		local found
+		found, index = Schema.subsceneIndex(self.scene, current.id)
+	end
+	local insertionIndex = (index or #self.scene.subscenes) + 1
+	if current and current.role == "outro" and index == #self.scene.subscenes then
+		-- Preserve the familiar Intro … Outro ordering when adding from the
+		-- default last entry; authors can still move either role afterward.
+		insertionIndex = index
+	end
+	local predecessor = self.scene.subscenes[insertionIndex - 1]
+	if predecessor and predecessor.nextTransitionId == "" then
+		predecessor.nextTransitionId = Schema.DEFAULT_FADE
+	end
+	table.insert(self.scene.subscenes, insertionIndex, subscene)
+	self:openSequenceOwner("subscene", subscene.id)
+	self:markDirty()
+end
+
+function EditorApp:moveSubscene(subsceneId, offset)
+	local subscene, index = Schema.subsceneIndex(self.scene, subsceneId)
+	local target = index and index + offset
+	if not target or target < 1 or target > #self.scene.subscenes then return end
+	table.remove(self.scene.subscenes, index)
+	table.insert(self.scene.subscenes, target, subscene)
+	self:markDirty()
+end
+
+function EditorApp:deleteSubscene(subsceneId)
+	local subscene, index = Schema.subsceneIndex(self.scene, subsceneId)
+	if not subscene or type(index) ~= "number" or #self.scene.subscenes <= 1 or subscene.role ~= "custom" then return end
+	local wasActive = self:getActiveSubscene().id == subsceneId
+	-- Keep the replacement record before mutating the ordered list. This avoids
+	-- depending on the removed item's former numeric index after deletion.
+	local replacement = self.scene.subscenes[index + 1] or self.scene.subscenes[index - 1]
+	table.remove(self.scene.subscenes, index)
+	Schema.clearSubsceneDestinations(self.scene, subsceneId)
+	if wasActive or (self.openSequence.owner == "interaction"
+		and not Schema.findInteraction(self.scene, self.openSequence.interactionId)) then
+		if replacement then
+			self:openSequenceOwner("subscene", replacement.id)
+		end
+	end
+	self:markDirty()
+end
+
 function EditorApp:_runnerContext()
 	local cursor = self.runner:getCursor()
 	return {
-		scene = self.scene,
+		scene = self:getActiveSubscene() and Schema.subsceneView(self.scene, self:getActiveSubscene()) or self.scene,
 		chapter = self:getChapter(),
 		project = self:getProject(),
 		editor = true,
@@ -1167,13 +1255,15 @@ end
 
 function EditorApp:onSceneStageChanged()
 	if self.scene then
-		self.presenter:enterScene(self.scene, self:getProject())
+		local subscene = self:getActiveSubscene()
+		self.presenter:enterScene(Schema.subsceneView(self.scene, subscene), self:getProject())
 	end
 end
 
 function EditorApp:captureCamera(callback, startCFrame)
 	if not startCFrame and self.scene then
-		local pose = Schema.findCameraPose(self:getProject(), self.scene.stage.cameraPoseId)
+		local subscene = self:getActiveSubscene()
+		local pose = Schema.findCameraPose(self:getProject(), Schema.effectivePoseId(self.scene, subscene))
 		startCFrame = pose and Schema.decodeCFrame(pose.cframe) or nil
 	end
 
@@ -1191,7 +1281,7 @@ function EditorApp:onCameraCaptureEnded()
 	self:_applyMode()
 
 	if self.mode == "scene" and self.scene then
-		self.presenter:enterScene(self.scene, self:getProject())
+		self.presenter:enterScene(Schema.subsceneView(self.scene, self:getActiveSubscene()), self:getProject())
 	elseif self.mode ~= "play" then
 		self.presenter:getRig():release()
 	end
@@ -1279,7 +1369,7 @@ function EditorApp:stop()
 		self.returnMode = nil
 
 		if self.mode == "scene" and self.scene then
-			self.presenter:enterScene(self.scene, self:getProject())
+			self.presenter:enterScene(Schema.subsceneView(self.scene, self:getActiveSubscene()), self:getProject())
 			self.runner:setSequence(self:getSequence(), self:_runnerContext(), { silent = true, cursor = self.runner:getCursor() })
 		else
 			self.presenter:leaveScene()
